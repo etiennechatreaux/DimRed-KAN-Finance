@@ -1,4 +1,6 @@
 data/
 models_saved/
+models/
 outputs/
 results/
+.vscode/
