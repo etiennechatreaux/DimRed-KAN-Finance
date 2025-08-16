@@ -3,4 +3,6 @@ models_saved/
 models/
 outputs/
 results/
+
 .vscode/
+__pycache__/
