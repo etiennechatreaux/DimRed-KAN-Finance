@@ -12,7 +12,8 @@ This project explores **Kolmogorov–Arnold Networks (KANs)** as nonlinear autoe
 - Compare KANs with traditional factor models (linear and nonlinear)
 
 ## Tech Stack
-- Python (PyTorch, NumPy, Matplotlib, yfinance)
+- Python (PyTorch, Numpy)
+- CUDA (GPU acceleration)
 - Custom implementation of KAN (B-splines, polynomial)
 
 ## Structure
