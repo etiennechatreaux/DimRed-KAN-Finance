@@ -1,7 +1,6 @@
 # KAN Autoencoder – Dimensionality Reduction in Finance
-Author : Etienne CHATREAUX
-
-Master thesis supervisor : Fouad BEN ABDELAZIZ
+Author : Etienne CHATREAUX  
+Master thesis supervisor : Fouad BEN ABDELAZIZ  
 
 This project explores **Kolmogorov–Arnold Networks (KANs)** as nonlinear autoencoders for dimensionality reduction. I have chosen this subject for my Master Thesis because I wanted something recent, interpretable and applicable to finance. 
 
@@ -20,19 +19,14 @@ This project explores **Kolmogorov–Arnold Networks (KANs)** as nonlinear autoe
 - Custom implementation of KAN (B-splines, polynomial)
 
 ## Structure
-figures/
-papers/
-src/
-└── models/ # Model implementations
-├── ae_kan.py # KAN Autoencoder
-├── ae_mlp.py # MLP Autoencoder (baseline)
-├── bases_1d.py # 1D basis functions (splines, polynomials)
-└── kan_layers.py # KAN custom layers
+'''
+figures/ # Plots and generated figures
+papers/ # Related papers, notes, references
+src/ # Source code
+├── models/ # Model implementations
+│ ├── ae_kan.py # KAN Autoencoder
+│ ├── ae_mlp.py # MLP Autoencoder (baseline)
+│ ├── bases_1d.py # 1D basis functions
+│ └── kan_layers.py # KAN custom layers
 └── utils/ # Utility functions
-
-.gitignore # Git ignore rules
-01_data_preprocessing.ipynb # Data preprocessing pipeline
-02_data_exploration.ipynb # Exploratory analysis
-03_mnist_test.ipynb # MNIST benchmark experiments
-README.md # Project documentation
-requirements.txt # Python dependencies
+'''
