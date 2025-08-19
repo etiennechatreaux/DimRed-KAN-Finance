@@ -20,14 +20,16 @@ This project explores **Kolmogorov–Arnold Networks (KANs)** as nonlinear autoe
 
 ## Structure
 ```
+data/
+results/
 figures/
 papers/
 src/ 
 ├── models/ # Model implementations
 │ ├── ae_kan.py # KAN Autoencoder
 │ ├── ae_mlp.py # MLP Autoencoder (baseline)
-│ ├── bases_1d.py # 1D basis functions
-│ └── kan_layers.py # KAN custom layers
+│ ├── bases_1d.py # 1D basis functions (B-splines and polynomial functions)
+│ └── kan_layers.py
 └── utils/
 ```
 
