@@ -31,5 +31,11 @@ src/
 │ ├── bases_1d.py # 1D basis functions (B-splines and polynomial functions)
 │ └── kan_layers.py
 └── utils/
+.gitignore
+01_data_preprocessing.ipynb
+02_data_exploration.ipynb
+03_mnist_test.ipynb 
+README.md
+requirements.txt
 ```
 
