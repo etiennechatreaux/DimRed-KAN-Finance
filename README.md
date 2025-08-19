@@ -2,7 +2,8 @@
 Author : Etienne CHATREAUX  
 Master thesis supervisor : Fouad BEN ABDELAZIZ  
 
-This project explores **Kolmogorov–Arnold Networks (KANs)** as nonlinear autoencoders for dimensionality reduction. I have chosen this subject for my Master Thesis because I wanted something recent, interpretable and applicable to finance. 
+This project explores **Kolmogorov–Arnold Networks (KANs)** as nonlinear autoencoders for dimensionality reduction. The project is part of my Master Thesis, motivated by the need for a recent, interpretable, and finance-oriented approach to factor modeling.  
+
 
 ## Overview
 - **Step 1 – MNIST Benchmark:** Train KAN autoencoders on MNIST to validate reconstruction ability on images.
