@@ -1,8 +1,11 @@
-# -*- coding: utf-8 -*-
 """
 Autoencodeur KAN (encodeur/décodeur basés sur KANLayer) avec choix de base :
 - "spline" (par défaut, M=16)
 - "poly" (degré p ; stabilisé par clipping/normalisation)
+
+Fonctions de loss supportées :
+- "mse" : Mean Squared Error (par défaut)
+- "huber" : Huber Loss (plus robuste aux outliers, paramètre delta configurable)
 
 Architecture flexible :
   Enc: KAN(N,h1) → (SiLU?) → Dropout → KAN(h1,h2) → (SiLU?) → ... → Linear(hn→k)
@@ -32,6 +35,9 @@ class KANAutoencoder(nn.Module):
         xmax: float = 3.5,
         dropout_p: float = 0.05,
         use_silu: bool = False,
+        # fonction de loss
+        loss_type: str = "mse",                    # "mse" | "huber"
+        huber_delta: float = 1.0,                  # paramètre delta pour Huber Loss
         # régularisations KAN
         lambda_alpha: float = 1e-4,
         lambda_group: float = 1e-5,
@@ -51,6 +57,12 @@ class KANAutoencoder(nn.Module):
             hidden_dims = [128, 32]
         self.hidden_dims = list(hidden_dims)
         self.use_silu = use_silu
+        
+        # Configuration de la fonction de loss
+        self.loss_type = loss_type.lower()
+        self.huber_delta = huber_delta
+        if self.loss_type not in ["mse", "huber"]:
+            raise ValueError(f"loss_type doit être 'mse' ou 'huber', reçu: {loss_type}")
 
         # Mémorise les options skip pour log/debug
         self._skip_opts = dict(
@@ -190,6 +202,17 @@ class KANAutoencoder(nn.Module):
         x_hat = self.decode(z, mask)
         return x_hat, z
 
+    def get_loss_criterion(self):
+        """
+        Retourne le critère de loss configuré.
+        """
+        if self.loss_type == "mse":
+            return torch.nn.MSELoss()
+        elif self.loss_type == "huber":
+            return torch.nn.HuberLoss(delta=self.huber_delta)
+        else:
+            raise ValueError(f"Type de loss non supporté: {self.loss_type}")
+
     def regularization(self) -> torch.Tensor:
         """
         Somme des régularisations de toutes les couches KAN (encodeur + décodeur).
@@ -254,7 +277,7 @@ class KANAutoencoder(nn.Module):
         )
 
         optimizer = torch.optim.Adam(self.parameters(), lr=learning_rate, weight_decay=weight_decay)
-        criterion = torch.nn.MSELoss()
+        criterion = self.get_loss_criterion()
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             optimizer, patience=max(1, patience // 2), factor=0.5
         )
@@ -269,13 +292,16 @@ class KANAutoencoder(nn.Module):
             print("=" * 90)
             print(f"📊 Données: {X_train.size(0)} train, {0 if X_val is None else X_val.size(0)} val")
             arch_str = f"{self.input_dim}"
-            for d in self.hidden_dims: arch_str += f" -> {d}"
+            for d in self.hidden_dims:
+                arch_str += f" -> {d}"
             arch_str += f" -> {self.k}"
-            for d in reversed(self.hidden_dims): arch_str += f" -> {d}"
+            for d in reversed(self.hidden_dims):
+                arch_str += f" -> {d}"
             arch_str += f" -> {self.input_dim}"
             print(f"🏗️  Architecture: {arch_str}")
             print(f"🔧 Device: {device}")
             print(f"⚙️  Paramètres: epochs={epochs}, batch_size={batch_size}, lr={learning_rate}")
+            print(f"📊 Loss: {self.loss_type.upper()}" + (f" (δ={self.huber_delta})" if self.loss_type == "huber" else ""))
             print(f"🎯 Régularisation: λ={lambda_reg}")
             tot = sum(p.numel() for p in self.parameters())
             trn = sum(p.numel() for p in self.parameters() if p.requires_grad)
@@ -384,7 +410,7 @@ class KANAutoencoder(nn.Module):
             print(f"🎉 ENTRAÎNEMENT TERMINÉ EN {elapsed:.2f}s")
             print("-" * 90)
             print("📊 RÉSULTATS FINAUX:")
-            print(f"   • MSE finale: {final_loss:.6f}")
+            print(f"   • {self.loss_type.upper()} finale: {final_loss:.6f}")
             print(f"   • Régularisation: {final_reg:.6f}")
             print(f"   • Loss totale: {final_loss + lambda_reg * final_reg:.6f}")
             if history['val_loss']:
