@@ -123,7 +123,7 @@ class KANLayer(nn.Module):
           L1(alpha) + group-lasso(c) + TV(c) [splines] + poly-decay(c) [poly]
           + (optionnel) L2 sur skip
         """
-        reg = 0.0
+        reg = torch.tensor(0.0, device=self.c.device, dtype=self.c.dtype)
         # L1 sur alpha (sparsité des connexions)
         if self.lambda_alpha > 0:
             reg = reg + self.lambda_alpha * self.alpha.abs().sum()
@@ -308,3 +308,5 @@ class KANLayer(nn.Module):
                 }
             }
             return stats
+
+
