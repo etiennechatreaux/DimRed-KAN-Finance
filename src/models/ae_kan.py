@@ -12,6 +12,9 @@ Architecture flexible :
   Dec: Linear(k→hn) → KAN(hn,h(n-1)) → (SiLU?) → Dropout → ... → KAN(h1→N)
   
 où h1, h2, ..., hn sont définies par le paramètre hidden_dims
+
+Skip connections :
+- max_skip_gain : si > 0, limite la valeur maximale du gain de skip global pendant l'entraînement
 """
 
 from __future__ import annotations
@@ -105,7 +108,8 @@ class KANAutoencoder(nn.Module):
         use_skip: bool = False,                    # skips dans chaque KANLayer
         skip_init: str = "zeros",                  # "zeros" | "xavier" | "identity"
         skip_gain: float = 1.0,
-        lambda_skip_l2: float = 0.0
+        lambda_skip_l2: float = 0.0,
+        max_skip_gain: float = 1.0                 # gain max autorisé (0 = pas de limite)
     ):
         super().__init__()
         self.input_dim = int(input_dim)
@@ -186,6 +190,7 @@ class KANAutoencoder(nn.Module):
 
         # --------- GLOBAL SKIP (entrée -> sortie) ---------
         self.use_global_skip = bool(use_global_skip)
+        self.max_skip_gain = float(max_skip_gain)
         if self.use_global_skip:
             self.global_skip = nn.Linear(input_dim, input_dim, bias=False)
             if skip_init == "zeros":
@@ -223,7 +228,12 @@ class KANAutoencoder(nn.Module):
         z = self.encode(x, mask)
         x_kan = self.decode(z, mask)
         if self.use_global_skip:
-            x_hat = x_kan + self.global_skip_gain * self.global_skip(x)
+            # Appliquer le clipping du gain si max_skip_gain > 0
+            if self.max_skip_gain > 0:
+                effective_gain = torch.clamp(self.global_skip_gain, max=self.max_skip_gain)
+            else:
+                effective_gain = self.global_skip_gain
+            x_hat = x_kan + effective_gain * self.global_skip(x)
         else:
             x_hat = x_kan
         return x_hat, z
@@ -278,7 +288,7 @@ class KANAutoencoder(nn.Module):
         history = {'train_loss': [], 'val_loss': [], 'learning_rate': [],
                    'regularization': [], 'skip_gain': [], 'skip_weight_norm': []}
 
-        best_val_loss = float('inf')
+        best_val_loss = float('10000')
         patience_counter = 0
         t0 = time.time()
 
@@ -306,7 +316,12 @@ class KANAutoencoder(nn.Module):
             # log skip evolution
             if self.use_global_skip:
                 with torch.no_grad():
-                    history['skip_gain'].append(float(self.global_skip_gain.item()))
+                    # Logger la valeur effective du gain (après clipping)
+                    if self.max_skip_gain > 0:
+                        effective_gain = torch.clamp(self.global_skip_gain, max=self.max_skip_gain)
+                    else:
+                        effective_gain = self.global_skip_gain
+                    history['skip_gain'].append(float(effective_gain.item()))
                     history['skip_weight_norm'].append(float(self.global_skip.weight.norm().item()))
 
             # validation
@@ -318,6 +333,8 @@ class KANAutoencoder(nn.Module):
                 history['val_loss'].append(val_loss)
                 scheduler.step(val_loss)
 
+                # Comparer avec la validation loss précédente
+                prev_val_loss = history['val_loss'][-2] if len(history['val_loss']) > 1 else float('inf')
                 if val_loss < best_val_loss - 1e-9:
                     best_val_loss = val_loss
                     patience_counter = 0
@@ -330,7 +347,7 @@ class KANAutoencoder(nn.Module):
                         break
 
             if verbose:
-                validation_symbol = "✅" if val_loss < best_val_loss - 1e-9 else "❌"
+                validation_symbol = "✅" if val_loss < prev_val_loss else "❌"
                 print(f"📈 Epoch {epoch+1}/{epochs} | Train: {avg_train_loss:.6f} | "
                       f"Val: {val_loss if X_val is not None else 0:.6f} {validation_symbol} | "
                       f"Reg: {avg_reg_loss:.6f} | LR: {optimizer.param_groups[0]['lr']:.2e}")
