@@ -124,25 +124,31 @@ class KANLayer(nn.Module):
           + (optionnel) L2 sur skip
         """
         reg = torch.tensor(0.0, device=self.c.device, dtype=self.c.dtype)
+        
         # L1 sur alpha (sparsité des connexions)
         if self.lambda_alpha > 0:
             reg = reg + self.lambda_alpha * self.alpha.abs().sum()
+            
         # Group-lasso sur c par (o,i) : ||c_{oi}||_2
         if self.lambda_group > 0:
             reg = reg + self.lambda_group * torch.sqrt((self.c ** 2).sum(dim=-1) + 1e-8).sum()
+            
         # TV-L1 sur l'axe des noeuds (splines)
         if self.basis_type == "spline" and self.lambda_tv > 0:
             reg = reg + self.lambda_tv * (self.c[:, :, 1:] - self.c[:, :, :-1]).abs().sum()
+            
         # Décroissance polynomiale (pénalise hauts degrés)
         if self.basis_type == "poly" and self.lambda_poly_decay > 0:
             deg = self.c.shape[-1]  # degree+1
             degrees = torch.arange(deg, device=self.c.device, dtype=self.c.dtype)  # 0..p
             weights = (degrees ** 2) / max(1, deg - 1) ** 2
             reg = reg + self.lambda_poly_decay * (self.c * weights).pow(2).sum()
+            
         # L2 sur le skip (optionnel)
         if self.use_skip and self.lambda_skip_l2 > 0:
             reg = reg + self.lambda_skip_l2 * (self.skip.weight.pow(2).sum())
-        return reg  # type: ignore
+            
+        return reg
 
     def set_regularization(
         self,
