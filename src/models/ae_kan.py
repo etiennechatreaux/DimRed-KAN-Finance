@@ -248,10 +248,12 @@ class KANAutoencoder(nn.Module):
 
     def regularization(self) -> torch.Tensor:
         reg_loss = torch.tensor(0.0, device=next(self.parameters()).device)
+        
         for layer in self.encoder_layers:
             reg_loss += layer.regularization()
         for layer in self.decoder_layers:
             reg_loss += layer.regularization()
+            
         if self.use_global_skip and self.lambda_global_skip_l2 > 0.0:
             reg_loss += self.lambda_global_skip_l2 * (self.global_skip.weight.pow(2).sum())
         return reg_loss

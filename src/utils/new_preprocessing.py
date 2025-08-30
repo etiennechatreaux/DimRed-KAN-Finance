@@ -577,6 +577,356 @@ def print_comparison_table(results, hp_name, values):
         print(f"🏆 MEILLEUR: {hp_name} = {best_value} (Loss: {best_result['test_loss']:.6f})")
 
 
+def reconstruct_model_from_results(result, hyperparams, input_dim):
+    """
+    Reconstruit un modèle KANAutoencoder à partir des résultats et hyperparamètres.
+    
+    Args:
+        result: Résultat d'entraînement contenant 'model_state'
+        hyperparams: Dictionnaire d'hyperparamètres utilisés
+        input_dim: Dimension d'entrée du modèle
+        
+    Returns:
+        model: Modèle KANAutoencoder reconstruit avec les poids chargés
+    """
+    from models.ae_kan import KANAutoencoder
+    
+    # Recréer le modèle avec les mêmes paramètres
+    model = KANAutoencoder(
+        input_dim=input_dim,
+        hidden_dims=hyperparams['hidden_dims_choices'],
+        k=hyperparams['latent_dims'],
+        basis_type=hyperparams['basis_types'],
+        M=hyperparams['M_values'],
+        poly_degree=hyperparams['poly_degrees'],
+        use_silu=hyperparams['use_silu_choices'],
+        dropout_p=hyperparams['dropout_rates'],
+        use_global_skip=hyperparams['use_global_skip'],
+        use_skip=hyperparams['use_skip_choices'],
+        skip_init=hyperparams['skip_init_choices'],
+        skip_gain=hyperparams['skip_gain_values'],
+        max_skip_gain=hyperparams['max_skip_gain'],
+        lambda_alpha=hyperparams['lambda_alpha_values'],
+        lambda_group=hyperparams['lambda_group_values'],
+        lambda_tv=hyperparams['lambda_tv_values'],
+        lambda_poly_decay=hyperparams['lambda_poly_decay_values'],
+        lambda_skip_l2=hyperparams['lambda_skip_l2_values'],
+        loss_type=hyperparams['loss_types'],
+        huber_delta=hyperparams['huber_deltas']
+    )
+    
+    # Charger les poids
+    model.load_state_dict(result['model_state'])
+    model.eval()
+    
+    return model
+
+
+def visualize_kan_functions(model_or_result, hyperparams=None, input_dim=None, save_path=None, max_connections=10, resolution=1000):
+    """
+    Visualise les fonctions apprises dans chaque couche KAN.
+    
+    Args:
+        model_or_result: Soit un modèle KANAutoencoder, soit un dictionnaire de résultats contenant 'model_state'
+        hyperparams: Dictionnaire d'hyperparamètres (requis si model_or_result est un résultat)
+        input_dim: Dimension d'entrée (requis si model_or_result est un résultat)
+        save_path: Chemin pour sauvegarder les graphiques
+        max_connections: Nombre maximum de connexions à afficher par couche
+        resolution: Résolution pour l'évaluation des fonctions
+    """
+    # Déterminer si on a un modèle ou un résultat
+    if hasattr(model_or_result, 'encoder_layers'):
+        # C'est un modèle
+        model = model_or_result
+    elif isinstance(model_or_result, dict) and 'model_state' in model_or_result:
+        # C'est un résultat d'entraînement
+        if hyperparams is None or input_dim is None:
+            raise ValueError("hyperparams et input_dim sont requis quand model_or_result est un dictionnaire de résultats")
+        print("🔄 Reconstruction du modèle à partir des résultats...")
+        model = reconstruct_model_from_results(model_or_result, hyperparams, input_dim)
+    else:
+        raise ValueError("model_or_result doit être un modèle KANAutoencoder ou un dictionnaire de résultats avec 'model_state'")
+    import matplotlib.pyplot as plt
+    import numpy as np
+    from pathlib import Path
+    from datetime import datetime
+    
+    model.eval()
+    
+    # Récupérer toutes les couches KAN
+    kan_layers = []
+    layer_names = []
+    
+    # Encoder layers
+    for i, layer in enumerate(model.encoder_layers):
+        kan_layers.append(layer)
+        layer_names.append(f"Encoder Layer {i+1}")
+    
+    # Decoder layers  
+    for i, layer in enumerate(model.decoder_layers):
+        kan_layers.append(layer)
+        layer_names.append(f"Decoder Layer {i+1}")
+    
+    if not kan_layers:
+        print("❌ Aucune couche KAN trouvée dans le modèle")
+        return
+    
+    print(f"🔍 Visualisation de {len(kan_layers)} couches KAN...")
+    
+    # Créer la grille d'évaluation
+    xmin, xmax = -3.5, 3.5  # Domaine par défaut des bases
+    x_eval = torch.linspace(xmin, xmax, resolution)
+    
+    # Nombre de sous-graphiques
+    n_layers = len(kan_layers)
+    n_cols = min(3, n_layers)
+    n_rows = (n_layers + n_cols - 1) // n_cols
+    
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(5*n_cols, 4*n_rows))
+    if n_layers == 1:
+        axes = [axes]
+    elif n_rows == 1:
+        axes = axes.reshape(1, -1)
+    
+    # Couleurs pour différencier les connexions
+    colors = ['red', 'blue', 'green', 'orange', 'purple', 'brown', 'pink', 'gray', 'olive', 'cyan']
+    
+    for layer_idx, (layer, layer_name) in enumerate(zip(kan_layers, layer_names)):
+        row = layer_idx // n_cols
+        col = layer_idx % n_cols
+        ax = axes[row, col] if n_rows > 1 else axes[col]
+        
+        print(f"  📊 {layer_name}: {layer.in_features}→{layer.out_features}")
+        
+        with torch.no_grad():
+            # Évaluer les bases
+            if x_eval.dim() == 1:
+                x_eval_batch = x_eval.unsqueeze(0)  # (1, resolution)
+            else:
+                x_eval_batch = x_eval
+                
+            try:
+                # Évaluer la base pour obtenir Phi (1, resolution, M)
+                Phi = layer.basis_1d(x_eval_batch)  # (1, resolution, M)
+                if Phi.dim() == 2:  # Si on a (resolution, M)
+                    Phi = Phi.unsqueeze(0)  # (1, resolution, M)
+                
+                # Sélectionner les connexions les plus importantes
+                alpha_abs = layer.alpha.abs()  # (out_features, in_features)
+                
+                # Prendre les connexions avec les plus grands alpha
+                flat_indices = torch.argsort(alpha_abs.flatten(), descending=True)
+                top_connections = flat_indices[:min(max_connections, alpha_abs.numel())]
+                
+                functions_plotted = 0
+                for flat_idx in top_connections:
+                    out_idx = flat_idx // layer.in_features
+                    in_idx = flat_idx % layer.in_features
+                    
+                    alpha_val = layer.alpha[out_idx, in_idx].item()
+                    c_coeffs = layer.c[out_idx, in_idx, :]  # (M,)
+                    
+                    # Calculer la fonction: alpha * (Phi @ c)
+                    # Phi[0, :, :] est (resolution, M), c_coeffs est (M,)
+                    func_values = alpha_val * torch.matmul(Phi[0], c_coeffs)  # (resolution,)
+                    
+                    # Convertir en numpy pour matplotlib
+                    x_np = x_eval.cpu().numpy()
+                    y_np = func_values.cpu().numpy()
+                    
+                    # Couleur pour cette connexion
+                    color = colors[functions_plotted % len(colors)]
+                    
+                    # Plot avec transparence pour éviter la surcharge visuelle
+                    alpha_plot = 0.8 if functions_plotted < 5 else 0.4
+                    ax.plot(x_np, y_np, 
+                           color=color, 
+                           alpha=alpha_plot,
+                           linewidth=2 if functions_plotted < 3 else 1,
+                           label=f'({in_idx}→{out_idx}) α={alpha_val:.3f}')
+                    
+                    functions_plotted += 1
+                    
+                    # Limiter le nombre de légendes pour la lisibilité
+                    if functions_plotted >= max_connections:
+                        break
+                
+                # Configuration du graphique
+                ax.set_title(f'{layer_name}\n({layer.basis_type}, {layer.in_features}→{layer.out_features})')
+                ax.set_xlabel('Input')
+                ax.set_ylabel('Function Output')
+                ax.grid(True, alpha=0.3)
+                
+                # Légende seulement pour les premières connexions
+                if functions_plotted <= 5:
+                    ax.legend(fontsize=8)
+                
+                # Statistiques dans le titre
+                max_alpha = alpha_abs.max().item()
+                sparsity = (alpha_abs < 1e-6).float().mean().item()
+                ax.text(0.02, 0.98, f'max(α)={max_alpha:.3f}\nsparsity={sparsity:.1%}', 
+                       transform=ax.transAxes, verticalalignment='top', 
+                       bbox=dict(boxstyle='round', facecolor='white', alpha=0.8),
+                       fontsize=8)
+                
+            except Exception as e:
+                ax.text(0.5, 0.5, f'Erreur: {str(e)}', transform=ax.transAxes, 
+                       ha='center', va='center')
+                print(f"    ❌ Erreur pour {layer_name}: {str(e)}")
+    
+    # Masquer les axes vides
+    for layer_idx in range(n_layers, n_rows * n_cols):
+        row = layer_idx // n_cols
+        col = layer_idx % n_cols
+        if n_rows > 1:
+            axes[row, col].set_visible(False)
+        elif n_cols > 1:
+            axes[col].set_visible(False)
+    
+    plt.tight_layout()
+    
+    # Sauvegarder si demandé
+    if save_path:
+        save_dir = Path(save_path).parent
+        save_dir.mkdir(exist_ok=True, parents=True)
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        print(f"💾 Visualisation sauvegardée: {save_path}")
+    else:
+        # Sauvegarde automatique
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        figures_dir = Path('figures')
+        figures_dir.mkdir(exist_ok=True)
+        auto_save_path = figures_dir / f'kan_functions_{timestamp}.png'
+        plt.savefig(auto_save_path, dpi=300, bbox_inches='tight')
+        print(f"💾 Visualisation sauvegardée: {auto_save_path}")
+    
+    plt.show()
+    return fig
+
+
+def visualize_kan_layers_detailed(model_or_result, hyperparams=None, input_dim=None, layer_indices=None, save_path=None):
+    """
+    Visualisation détaillée des couches KAN spécifiques avec matrices de coefficients.
+    
+    Args:
+        model_or_result: Soit un modèle KANAutoencoder, soit un dictionnaire de résultats contenant 'model_state'
+        hyperparams: Dictionnaire d'hyperparamètres (requis si model_or_result est un résultat)
+        input_dim: Dimension d'entrée (requis si model_or_result est un résultat)
+        layer_indices: Liste des indices de couches à visualiser (None = toutes)
+        save_path: Chemin de sauvegarde
+    """
+    # Déterminer si on a un modèle ou un résultat
+    if hasattr(model_or_result, 'encoder_layers'):
+        # C'est un modèle
+        model = model_or_result
+    elif isinstance(model_or_result, dict) and 'model_state' in model_or_result:
+        # C'est un résultat d'entraînement
+        if hyperparams is None or input_dim is None:
+            raise ValueError("hyperparams et input_dim sont requis quand model_or_result est un dictionnaire de résultats")
+        print("🔄 Reconstruction du modèle à partir des résultats...")
+        model = reconstruct_model_from_results(model_or_result, hyperparams, input_dim)
+    else:
+        raise ValueError("model_or_result doit être un modèle KANAutoencoder ou un dictionnaire de résultats avec 'model_state'")
+    import matplotlib.pyplot as plt
+    import numpy as np
+    from pathlib import Path
+    from datetime import datetime
+    
+    model.eval()
+    
+    # Récupérer les couches
+    all_layers = list(model.encoder_layers) + list(model.decoder_layers)
+    all_names = [f"Enc{i+1}" for i in range(len(model.encoder_layers))] + \
+                [f"Dec{i+1}" for i in range(len(model.decoder_layers))]
+    
+    if layer_indices is None:
+        layer_indices = list(range(len(all_layers)))
+    
+    selected_layers = [all_layers[i] for i in layer_indices]
+    selected_names = [all_names[i] for i in layer_indices]
+    
+    print(f"🔬 Visualisation détaillée de {len(selected_layers)} couches...")
+    
+    for layer_idx, (layer, name) in enumerate(zip(selected_layers, selected_names)):
+        fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(15, 12))
+        fig.suptitle(f'Analyse Détaillée - {name} ({layer.in_features}→{layer.out_features})', 
+                     fontsize=16, fontweight='bold')
+        
+        with torch.no_grad():
+            # 1. Matrice Alpha (sparsité des connexions)
+            alpha_matrix = layer.alpha.cpu().numpy()
+            im1 = ax1.imshow(alpha_matrix, cmap='RdBu', aspect='auto')
+            ax1.set_title('Matrice Alpha (Coefficients de connexion)')
+            ax1.set_xlabel('Input Features')
+            ax1.set_ylabel('Output Features')
+            plt.colorbar(im1, ax=ax1, label='Alpha Value')
+            
+            # 2. Norme des coefficients C par connexion
+            c_norms = torch.sqrt((layer.c ** 2).sum(dim=-1)).cpu().numpy()
+            im2 = ax2.imshow(c_norms, cmap='viridis', aspect='auto')
+            ax2.set_title('Norme des Coefficients C par Connexion')
+            ax2.set_xlabel('Input Features')
+            ax2.set_ylabel('Output Features')
+            plt.colorbar(im2, ax=ax2, label='||C|| Norm')
+            
+            # 3. Distribution des valeurs Alpha
+            alpha_flat = alpha_matrix.flatten()
+            ax3.hist(alpha_flat, bins=50, alpha=0.7, edgecolor='black')
+            ax3.set_title('Distribution des Valeurs Alpha')
+            ax3.set_xlabel('Alpha Value')
+            ax3.set_ylabel('Frequency')
+            ax3.axvline(0, color='red', linestyle='--', alpha=0.7, label='Zero')
+            ax3.legend()
+            
+            # 4. Statistiques de sparsité et activité
+            sparsity = (np.abs(alpha_flat) < 1e-6).mean()
+            active_connections = np.sum(np.abs(alpha_flat) > 1e-6)
+            total_connections = alpha_flat.size
+            
+            stats_text = f"""Statistiques de la couche:
+            
+• Type: {layer.basis_type}
+• Connexions totales: {total_connections}
+• Connexions actives: {active_connections}
+• Sparsité: {sparsity:.1%}
+• Alpha max: {np.abs(alpha_flat).max():.4f}
+• Alpha moyen: {np.abs(alpha_flat).mean():.4f}
+• Biais max: {layer.bias.abs().max().item():.4f}
+"""
+            
+            if layer.use_skip:
+                skip_norm = layer.skip.weight.norm().item()
+                skip_gain = layer.skip_gain.item()
+                stats_text += f"• Skip norm: {skip_norm:.4f}\n• Skip gain: {skip_gain:.4f}"
+            
+            ax4.text(0.05, 0.95, stats_text, transform=ax4.transAxes, 
+                    verticalalignment='top', fontsize=10,
+                    bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.8))
+            ax4.set_xlim(0, 1)
+            ax4.set_ylim(0, 1)
+            ax4.axis('off')
+            ax4.set_title('Statistiques de la Couche')
+        
+        plt.tight_layout()
+        
+        # Sauvegarder
+        if save_path:
+            save_dir = Path(save_path).parent
+            save_dir.mkdir(exist_ok=True, parents=True)
+            layer_save_path = save_dir / f"{Path(save_path).stem}_layer_{name}.png"
+            plt.savefig(layer_save_path, dpi=300, bbox_inches='tight')
+            print(f"💾 Couche {name} sauvegardée: {layer_save_path}")
+        else:
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            figures_dir = Path('figures')
+            figures_dir.mkdir(exist_ok=True)
+            layer_save_path = figures_dir / f'kan_layer_detail_{name}_{timestamp}.png'
+            plt.savefig(layer_save_path, dpi=300, bbox_inches='tight')
+            print(f"💾 Couche {name} sauvegardée: {layer_save_path}")
+        
+        plt.show()
+
+
 def change_hyperparam(hyperparameters_grid, hp_to_change, value):
     if hp_to_change in hyperparameters_grid.keys():
         hyperparameters_grid[hp_to_change] = value
