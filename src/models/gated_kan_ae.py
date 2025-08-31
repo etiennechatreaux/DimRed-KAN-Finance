@@ -378,26 +378,44 @@ class GatedKANAutoencoder(nn.Module):
         print(f"   🔧 Orthogonality λ: {self.lambda_orthogonal:.2e}")
 
     def fit(
-        self, X: torch.Tensor,
-        epochs: int = 100, batch_size: int = 64,
-        learning_rate: float = 0.001, weight_decay: float = 1e-5,
-        validation_split: float = 0.2, patience: int = 10,
-        verbose: bool = True, lambda_reg: float = 1.0,
-        device: Optional[torch.device] = None
+        self, 
+        X_train: torch.Tensor,
+        W_train: Optional[torch.Tensor] = None,  # ✅ Poids d'entraînement
+        M_train: Optional[torch.Tensor] = None,  # ✅ Masques d'entraînement
+        X_val: Optional[torch.Tensor] = None,
+        W_val: Optional[torch.Tensor] = None,    # ✅ Poids validation
+        M_val: Optional[torch.Tensor] = None,    # ✅ Masques validation
+        # Paramètres legacy pour compatibilité (ignorés si X_val fourni)
+        validation_split: float = 0.2,
+        epochs: int = 100, 
+        batch_size: int = 64,
+        learning_rate: float = 0.001, 
+        weight_decay: float = 1e-5,
+        patience: int = 10,
+        verbose: bool = True, 
+        lambda_reg: float = 1.0,
+        use_weighted_loss: bool = True,          # ✅ Activer la loss pondérée
+        device: Optional[torch.Tensor] = None
     ) -> dict:
         """
         Entraîne le modèle Gated KAN Autoencoder.
         
         Args:
-            X: Données d'entraînement (n_samples, input_dim)
+            X_train: Données d'entraînement (n_samples, input_dim)
+            W_train: Poids de fiabilité d'entraînement (n_samples, input_dim)
+            M_train: Masques durs d'entraînement (n_samples, input_dim)
+            X_val: Données de validation (n_val_samples, input_dim). Si None, utilise validation_split
+            W_val: Poids de fiabilité de validation (n_val_samples, input_dim)
+            M_val: Masques durs de validation (n_val_samples, input_dim)
+            validation_split: Fraction pour la validation (ignoré si X_val fourni)
             epochs: Nombre d'époques maximum
             batch_size: Taille des batches
             learning_rate: Taux d'apprentissage
             weight_decay: Décroissance des poids
-            validation_split: Fraction pour la validation
             patience: Patience pour early stopping
             verbose: Affichage détaillé
             lambda_reg: Coefficient de régularisation
+            use_weighted_loss: Si True, utilise les poids W dans la loss
             device: Device pour l'entraînement
             
         Returns:
@@ -408,17 +426,50 @@ class GatedKANAutoencoder(nn.Module):
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.to(device)
 
-        # Split train/val
-        n_samples = X.size(0)
-        n_val = int(n_samples * validation_split)
-        indices = torch.randperm(n_samples)
-        X_train, X_val = X[indices[n_val:]], (X[indices[:n_val]] if n_val > 0 else None)
+        # Gestion du split train/val
+        if X_val is not None:
+            # Utilisation des ensembles fournis (recommandé pour données temporelles)
+            if verbose:
+                print("🕒 Utilisation d'ensembles train/val séparés")
+                print(f"   📊 Train: {X_train.shape[0]} échantillons")
+                print(f"   📊 Val: {X_val.shape[0]} échantillons")
+                if use_weighted_loss and W_train is not None:
+                    print("   🎯 Loss pondérée activée avec poids W et masques M")
+        else:
+            # Fallback : split aléatoire (pour compatibilité legacy)
+            if verbose:
+                print(f"⚠️  Utilisation du split aléatoire (validation_split={validation_split})")
+            
+            n_samples = X_train.size(0)
+            n_val = int(n_samples * validation_split)
+            indices = torch.randperm(n_samples)
+            X_train, X_val = X_train[indices[n_val:]], (X_train[indices[:n_val]] if n_val > 0 else None)
 
-        train_loader = torch.utils.data.DataLoader(
-            torch.utils.data.TensorDataset(X_train, X_train),
-            batch_size=batch_size, shuffle=True,
-            pin_memory=(device.type == "cuda")
-        )
+            # Si split aléatoire, splitter aussi W et M
+            if W_train is not None:
+                W_train, W_val = W_train[indices[n_val:]], (W_train[indices[:n_val]] if n_val > 0 else None)
+            if M_train is not None:
+                M_train, M_val = M_train[indices[n_val:]], (M_train[indices[:n_val]] if n_val > 0 else None)
+
+        # Création des DataLoaders
+        if use_weighted_loss and W_train is not None and M_train is not None:
+            # DataLoader avec poids et masques
+            train_dataset = torch.utils.data.TensorDataset(X_train, X_train, W_train, M_train)
+            train_loader = torch.utils.data.DataLoader(
+                train_dataset, batch_size=batch_size, shuffle=True,
+                pin_memory=(device.type == "cuda")
+            )
+            has_weights = True
+        else:
+            # DataLoader standard (fallback)
+            train_dataset = torch.utils.data.TensorDataset(X_train, X_train)
+            train_loader = torch.utils.data.DataLoader(
+                train_dataset, batch_size=batch_size, shuffle=True,
+                pin_memory=(device.type == "cuda")
+            )
+            has_weights = False
+            if verbose and use_weighted_loss:
+                print("⚠️  Loss pondérée demandée mais W_train/M_train manquants -> fallback loss standard")
 
         optimizer = torch.optim.Adam(self.parameters(), lr=learning_rate, weight_decay=weight_decay)
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=max(1, patience // 2), factor=0.5)
@@ -433,7 +484,7 @@ class GatedKANAutoencoder(nn.Module):
 
         best_val_loss = float('inf')
         patience_counter = 0
-        t0 = time.time()
+        start_time = time.time()
 
         for epoch in range(epochs):
             self.train()
@@ -443,38 +494,78 @@ class GatedKANAutoencoder(nn.Module):
             epoch_gate_values = []
             epoch_orth_violations = []
 
-            for batch_x, _ in train_loader:
-                batch_x = batch_x.to(device, non_blocking=True)
-                optimizer.zero_grad(set_to_none=True)
-                
-                # Forward pass
-                x_hat, z, gate, x_kan, x_skip = self(batch_x)
-                
-                # Calcul des losses
-                losses = self.compute_loss(batch_x, x_hat, x_kan, x_skip, lambda_reg)
-                
-                # Backward pass
-                losses['total_loss'].backward()
-                optimizer.step()
+            # Boucle d'entraînement adaptée aux poids/masques
+            if has_weights:
+                for batch_x, _, batch_w, batch_m in train_loader:
+                    batch_x = batch_x.to(device, non_blocking=True)
+                    batch_w = batch_w.to(device, non_blocking=True)
+                    batch_m = batch_m.to(device, non_blocking=True)
+                    
+                    optimizer.zero_grad(set_to_none=True)
+                    
+                    # Forward pass
+                    x_hat, z, gate, x_kan, x_skip = self(batch_x)
+                    
+                    # Calcul des losses avec pondération
+                    losses = self.compute_weighted_loss(batch_x, x_hat, x_kan, x_skip, 
+                                                      batch_w, batch_m, lambda_reg)
+                    
+                    # Backward pass
+                    losses['total_loss'].backward()
+                    optimizer.step()
 
-                # Accumulation des métriques
-                epoch_losses['total'] += losses['total_loss'].item()
-                epoch_losses['recon'] += losses['reconstruction_loss'].item()
-                epoch_losses['reg'] += losses['regularization_loss'].item()
-                epoch_losses['orth'] += losses['orthogonality_loss'].item()
-                
-                # Métriques du gate
-                if gate.dim() > 0:
-                    epoch_gate_values.append(gate.mean().item())  # ← Gate EFFECTIF
-                else:
-                    epoch_gate_values.append(gate.item())
-                
-                # Violation d'orthogonalité (cosine similarity)
-                with torch.no_grad():
-                    cos_sim = torch.nn.functional.cosine_similarity(
-                        x_kan.flatten(1), x_skip.flatten(1), dim=1
-                    ).abs().mean().item()
-                    epoch_orth_violations.append(cos_sim)
+                    # Accumulation des métriques
+                    epoch_losses['total'] += losses['total_loss'].item()
+                    epoch_losses['recon'] += losses['reconstruction_loss'].item()
+                    epoch_losses['reg'] += losses['regularization_loss'].item()
+                    epoch_losses['orth'] += losses['orthogonality_loss'].item()
+                    
+                    # Métriques du gate
+                    if gate.dim() > 0:
+                        epoch_gate_values.append(gate.mean().item())
+                    else:
+                        epoch_gate_values.append(gate.item())
+                    
+                    # Violation d'orthogonalité (cosine similarity)
+                    with torch.no_grad():
+                        cos_sim = torch.nn.functional.cosine_similarity(
+                            x_kan.flatten(1), x_skip.flatten(1), dim=1
+                        ).abs().mean().item()
+                        epoch_orth_violations.append(cos_sim)
+            else:
+                # Boucle standard (sans poids)
+                for batch_x, _ in train_loader:
+                    batch_x = batch_x.to(device, non_blocking=True)
+                    optimizer.zero_grad(set_to_none=True)
+                    
+                    # Forward pass
+                    x_hat, z, gate, x_kan, x_skip = self(batch_x)
+                    
+                    # Calcul des losses
+                    losses = self.compute_loss(batch_x, x_hat, x_kan, x_skip, lambda_reg)
+                    
+                    # Backward pass
+                    losses['total_loss'].backward()
+                    optimizer.step()
+
+                    # Accumulation des métriques
+                    epoch_losses['total'] += losses['total_loss'].item()
+                    epoch_losses['recon'] += losses['reconstruction_loss'].item()
+                    epoch_losses['reg'] += losses['regularization_loss'].item()
+                    epoch_losses['orth'] += losses['orthogonality_loss'].item()
+                    
+                    # Métriques du gate
+                    if gate.dim() > 0:
+                        epoch_gate_values.append(gate.mean().item())
+                    else:
+                        epoch_gate_values.append(gate.item())
+                    
+                    # Violation d'orthogonalité (cosine similarity)
+                    with torch.no_grad():
+                        cos_sim = torch.nn.functional.cosine_similarity(
+                            x_kan.flatten(1), x_skip.flatten(1), dim=1
+                        ).abs().mean().item()
+                        epoch_orth_violations.append(cos_sim)
 
             # Moyennes par époque
             n_batches = len(train_loader)
@@ -493,16 +584,33 @@ class GatedKANAutoencoder(nn.Module):
             history['skip_contribution'].append(1 - avg_gate)
             history['orthogonality_violation'].append(avg_orth_violation)
 
-            # Validation
+            # Validation avec ou sans poids
             val_loss = 0.0
             if X_val is not None:
                 self.eval()
                 with torch.no_grad():
-                    x_hat_val, _, _, _, _ = self(X_val.to(device))
-                    if self.loss_type == "mse":
-                        val_loss = torch.nn.functional.mse_loss(x_hat_val, X_val.to(device)).item()
-                    elif self.loss_type == "huber":
-                        val_loss = torch.nn.functional.huber_loss(x_hat_val, X_val.to(device), delta=self.huber_delta).item()
+                    if use_weighted_loss and W_val is not None and M_val is not None:
+                        # Validation pondérée
+                        x_hat_val, _, _, _, _ = self(X_val.to(device))
+                        effective_weights_val = W_val.to(device) * M_val.to(device)
+                        
+                        if self.loss_type == "mse":
+                            # MSE pondérée manuelle
+                            diff = (x_hat_val - X_val.to(device)) ** 2
+                            weighted_diff = diff * effective_weights_val
+                            val_loss = weighted_diff.sum() / effective_weights_val.sum()
+                        elif self.loss_type == "huber":
+                            # Utiliser WeightedHuberLoss pour validation
+                            from .ae_kan import WeightedHuberLoss
+                            val_criterion = WeightedHuberLoss(delta=self.huber_delta)
+                            val_loss = val_criterion(x_hat_val, X_val.to(device), effective_weights_val).item()
+                    else:
+                        # Validation standard
+                        x_hat_val, _, _, _, _ = self(X_val.to(device))
+                        if self.loss_type == "mse":
+                            val_loss = torch.nn.functional.mse_loss(x_hat_val, X_val.to(device)).item()
+                        elif self.loss_type == "huber":
+                            val_loss = torch.nn.functional.huber_loss(x_hat_val, X_val.to(device), delta=self.huber_delta).item()
                 
                 history['val_loss'].append(val_loss)
                 scheduler.step(val_loss)
@@ -530,25 +638,14 @@ class GatedKANAutoencoder(nn.Module):
                 print(f"   ↳ Recon: {avg_losses['recon']:.6f} | "
                       f"Reg: {avg_losses['reg']:.6f} | "
                       f"Orth: {avg_losses['orth']:.6f} {orth_symbol}")
-                print(f"   🎛️  Gate: {avg_gate:.3f} (KAN: {avg_gate:.1%}, Skip: {1-avg_gate:.1%}) | "
+                print(f"   🎛️  Gate: {avg_gate:.3f} (KAN: {avg_gate*100:.1f}%, Skip: {(1-avg_gate)*100:.1f}%) | "
                       f"Orth_viol: {avg_orth_violation:.4f}")
-                # print(f"   📚 LR: {optimizer.param_groups[0]['lr']:.2e}")
 
-        # Restauration du meilleur modèle
+        # Restaurer le meilleur modèle
         if 'best_state' in locals():
             self.load_state_dict(best_state)
 
-        history['training_time'] = time.time() - t0
-        
-        # Statistiques finales
-        if verbose:
-            final_gate_info = self.get_gate_info()
-            print(f"\n🏁 Entraînement terminé en {history['training_time']:.1f}s")
-            print(f"   🎯 Meilleure val loss: {best_val_loss:.6f}")
-            print(f"   🎛️  Gate final: KAN={final_gate_info['kan_contribution']:.1%} | "
-                  f"Skip={final_gate_info['skip_contribution']:.1%}")
-            print(f"   🔀 Orthogonalité finale: {history['orthogonality_violation'][-1]:.4f}")
-
+        history['training_time'] = time.time() - start_time
         return history
 
     def get_loss_criterion(self, weighted: bool = False):
@@ -1085,3 +1182,54 @@ class GatedKANAutoencoder(nn.Module):
             z = self.encode(x_orth)
         
         return z
+
+    def compute_weighted_loss(self, x: torch.Tensor, x_hat: torch.Tensor, x_kan: torch.Tensor, 
+                         x_skip: torch.Tensor, weights: torch.Tensor, masks: torch.Tensor,
+                         lambda_reg: float = 1.0) -> dict:
+        """
+        Calcule la loss totale avec pondération par les poids de fiabilité.
+        
+        Args:
+            x: Données originales
+            x_hat: Reconstruction
+            x_kan: Composante KAN
+            x_skip: Composante skip
+            weights: Poids de fiabilité (0-1)
+            masks: Masques durs (0/1)
+            lambda_reg: Coefficient de régularisation
+        """
+        # Poids effectifs : combine poids soft et masques durs
+        effective_weights = weights * masks
+        
+        # Loss de reconstruction pondérée
+        if self.loss_type == "mse":
+            # MSE pondérée manuelle
+            diff_squared = (x_hat - x) ** 2
+            weighted_diff = diff_squared * effective_weights
+            # Normalisation par la somme des poids pour éviter biais
+            recon_loss = weighted_diff.sum() / (effective_weights.sum() + 1e-8)
+        elif self.loss_type == "huber":
+            # Utiliser WeightedHuberLoss
+            from .ae_kan import WeightedHuberLoss
+            weighted_criterion = WeightedHuberLoss(delta=self.huber_delta)
+            recon_loss = weighted_criterion(x_hat, x, weights=effective_weights)
+        else:
+            raise ValueError(f"Type de loss non supporté: {self.loss_type}")
+        
+        # Régularisations (identiques)
+        reg_loss = self.regularization()
+        
+        # Pénalité d'orthogonalité (identique)
+        orth_loss = self.orthogonality_loss(x_kan, x_skip)
+        
+        # Loss totale
+        total_loss = (recon_loss + 
+                 lambda_reg * reg_loss + 
+                 self.lambda_orthogonal * orth_loss)
+        
+        return {
+            'total_loss': total_loss,
+            'reconstruction_loss': recon_loss,
+            'regularization_loss': reg_loss,
+            'orthogonality_loss': orth_loss
+        }

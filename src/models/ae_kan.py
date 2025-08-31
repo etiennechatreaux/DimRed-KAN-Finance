@@ -259,23 +259,66 @@ class KANAutoencoder(nn.Module):
         return reg_loss
 
     def fit(
-        self, X: torch.Tensor,
-        epochs: int = 100, batch_size: int = 64,
-        learning_rate: float = 0.001, weight_decay: float = 1e-5,
-        validation_split: float = 0.2, patience: int = 10,
-        verbose: bool = True, lambda_reg: float = 1.0,
-        device: Optional[torch.device] = None
+        self, 
+        X_train: torch.Tensor,
+        W_train: Optional[torch.Tensor] = None,  # ✅ Ajouter les poids
+        M_train: Optional[torch.Tensor] = None,  # ✅ Ajouter les masques
+        X_val: Optional[torch.Tensor] = None,
+        W_val: Optional[torch.Tensor] = None,    # ✅ Poids validation
+        M_val: Optional[torch.Tensor] = None,    # ✅ Masques validation
+        # Paramètres legacy pour compatibilité (ignorés si X_val fourni)
+        validation_split: float = 0.2,
+        epochs: int = 100, 
+        batch_size: int = 64,
+        learning_rate: float = 0.001, 
+        weight_decay: float = 1e-5,
+        patience: int = 10,
+        verbose: bool = True, 
+        lambda_reg: float = 1.0,
+        device: Optional[torch.device] = None,
+        use_weighted_loss: bool = True,          # ✅ Activer la loss pondérée
     ) -> dict:
+        """
+        Entraîne le modèle KAN Autoencoder.
+        
+        Args:
+            X_train: Données d'entraînement (n_samples, input_dim)
+            X_val: Données de validation (n_val_samples, input_dim). Si None, utilise validation_split
+            validation_split: Fraction pour la validation (ignoré si X_val fourni)
+            epochs: Nombre d'époques maximum
+            batch_size: Taille des batches
+            learning_rate: Taux d'apprentissage
+            weight_decay: Décroissance des poids
+            patience: Patience pour early stopping
+            verbose: Affichage détaillé
+            lambda_reg: Coefficient de régularisation
+            device: Device pour l'entraînement
+            
+        Returns:
+            dict: Historique d'entraînement
+        """
         import time
         if device is None:
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.to(device)
 
-        # split train/val
-        n_samples = X.size(0)
-        n_val = int(n_samples * validation_split)
-        indices = torch.randperm(n_samples)
-        X_train, X_val = X[indices[n_val:]], (X[indices[:n_val]] if n_val > 0 else None)
+        # Gestion du split train/val
+        if X_val is not None:
+            # Utilisation des ensembles fournis (recommandé pour données temporelles)
+            if verbose:
+                print(f"🕒 Utilisation d'ensembles train/val séparés")
+                print(f"   📊 Train: {X_train.shape[0]} échantillons")
+                print(f"   📊 Val: {X_val.shape[0]} échantillons")
+        else:
+            # Fallback : split aléatoire (pour compatibilité legacy)
+            if verbose:
+                print(f"⚠️  Utilisation du split aléatoire (validation_split={validation_split})")
+                print(f"   💡 Recommandation: fournir X_val pour données temporelles")
+            
+            n_samples = X_train.size(0)
+            n_val = int(n_samples * validation_split)
+            indices = torch.randperm(n_samples)
+            X_train, X_val = X_train[indices[n_val:]], (X_train[indices[:n_val]] if n_val > 0 else None)
 
         train_loader = torch.utils.data.DataLoader(
             torch.utils.data.TensorDataset(X_train, X_train),
@@ -297,17 +340,46 @@ class KANAutoencoder(nn.Module):
         for epoch in range(epochs):
             self.train()
             train_loss, reg_loss = 0.0, 0.0
-            for batch_x, _ in train_loader:
-                batch_x = batch_x.to(device, non_blocking=True)
-                optimizer.zero_grad(set_to_none=True)
-                x_reconstructed, _ = self(batch_x)
-                recon_loss = criterion(x_reconstructed, batch_x)
-                reg_term = self.regularization()
-                loss = recon_loss + lambda_reg * reg_term
-                loss.backward()
-                optimizer.step()
-                train_loss += recon_loss.item()
-                reg_loss += reg_term.item()
+            
+            if use_weighted_loss and W_train is not None:
+                # Utiliser la WeightedHuberLoss avec les poids
+                weighted_criterion = WeightedHuberLoss(delta=self.huber_delta)
+                
+                # DataLoader avec W et M
+                train_dataset = torch.utils.data.TensorDataset(X_train, X_train, W_train, M_train)
+                train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+                
+                for batch_x, _, batch_w, batch_m in train_loader:
+                    batch_x = batch_x.to(device, non_blocking=True)
+                    batch_w = batch_w.to(device, non_blocking=True)
+                    batch_m = batch_m.to(device, non_blocking=True)
+                    
+                    optimizer.zero_grad(set_to_none=True)
+                    x_reconstructed, _ = self(batch_x)
+                    
+                    # ✅ Loss pondérée avec masquage
+                    effective_weights = batch_w * batch_m  # Combine soft weights + hard mask
+                    recon_loss = weighted_criterion(x_reconstructed, batch_x, weights=effective_weights)
+                    
+                    reg_term = self.regularization()
+                    loss = recon_loss + lambda_reg * reg_term
+                    loss.backward()
+                    optimizer.step()
+                    train_loss += recon_loss.item()
+                    reg_loss += reg_term.item()
+            else:
+                # Fallback : loss non pondérée (actuel)
+                for batch_x, _ in train_loader:
+                    batch_x = batch_x.to(device, non_blocking=True)
+                    optimizer.zero_grad(set_to_none=True)
+                    x_reconstructed, _ = self(batch_x)
+                    recon_loss = criterion(x_reconstructed, batch_x)  # ⚠️ Aucun poids !
+                    reg_term = self.regularization()
+                    loss = recon_loss + lambda_reg * reg_term
+                    loss.backward()
+                    optimizer.step()
+                    train_loss += recon_loss.item()
+                    reg_loss += reg_term.item()
 
             avg_train_loss = train_loss / len(train_loader)
             avg_reg_loss = reg_loss / len(train_loader)
@@ -327,6 +399,7 @@ class KANAutoencoder(nn.Module):
                     history['skip_weight_norm'].append(float(self.global_skip.weight.norm().item()))
 
             # validation
+            val_loss = None
             if X_val is not None:
                 self.eval()
                 with torch.no_grad():
@@ -348,14 +421,17 @@ class KANAutoencoder(nn.Module):
                             print(f"🛑 Early stopping à l'époque {epoch+1}")
                         break
 
-            if verbose:
+            if verbose and val_loss is not None:
                 validation_symbol = "✅" if val_loss < prev_val_loss else "❌"
                 print(f"📈 Epoch {epoch+1}/{epochs} | Train: {avg_train_loss:.6f} | "
-                      f"Val: {val_loss if X_val is not None else 0:.6f} {validation_symbol} | "
+                      f"Val: {val_loss:.6f} {validation_symbol} | "
                       f"Reg: {avg_reg_loss:.6f} | LR: {optimizer.param_groups[0]['lr']:.2e}")
                 if self.use_global_skip:
                     print(f"   ↳ skip_gain={history['skip_gain'][-1]:.4f} | "
                           f"||W_skip||={history['skip_weight_norm'][-1]:.4f}")
+            elif verbose:
+                print(f"📈 Epoch {epoch+1}/{epochs} | Train: {avg_train_loss:.6f} | "
+                      f"Reg: {avg_reg_loss:.6f} | LR: {optimizer.param_groups[0]['lr']:.2e}")
 
         if 'best_state' in locals():
             self.load_state_dict(best_state)
