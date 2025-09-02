@@ -7,3 +7,6 @@ results/
 __pycache__/
 
 dontshare/
+redaction_memoire/
+
+10_kan_ae_pca_residuals.ipynb
