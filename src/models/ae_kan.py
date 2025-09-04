@@ -258,6 +258,68 @@ class KANAutoencoder(nn.Module):
             reg_loss += self.lambda_global_skip_l2 * (self.global_skip.weight.pow(2).sum())
         return reg_loss
 
+    def detailed_regularization(self) -> dict:
+        """
+        Retourne les différents types de régularisation séparément
+        """
+        device = next(self.parameters()).device
+        
+        # Régularisation des couches KAN
+        kan_reg = torch.tensor(0.0, device=device)
+        for layer in self.encoder_layers:
+            kan_reg += layer.regularization()
+        for layer in self.decoder_layers:
+            kan_reg += layer.regularization()
+        
+        # Régularisation du skip global
+        skip_l2_reg = torch.tensor(0.0, device=device)
+        if self.use_global_skip and self.lambda_global_skip_l2 > 0.0:
+            skip_l2_reg = self.lambda_global_skip_l2 * (self.global_skip.weight.pow(2).sum())
+        
+        return {
+            'kan_reg': kan_reg,
+            'skip_l2_reg': skip_l2_reg,
+            'total_reg': kan_reg + skip_l2_reg
+        }
+
+    def get_contribution_metrics(self) -> dict:
+        """
+        Calcule les métriques de contribution linéaire vs non-linéaire
+        """
+        with torch.no_grad():
+            # Norme du skip linéaire (||L||_F²)
+            if self.use_global_skip:
+                linear_norm_sq = self.global_skip.weight.pow(2).sum().item()
+            else:
+                linear_norm_sq = 0.0
+                
+            # Norme des couches KAN (||N||_F²) - approximation
+            kan_norm_sq = 0.0
+            for layer in self.encoder_layers:
+                kan_norm_sq += layer.c.pow(2).sum().item()
+                kan_norm_sq += layer.alpha.pow(2).sum().item()
+            for layer in self.decoder_layers:
+                kan_norm_sq += layer.c.pow(2).sum().item()
+                kan_norm_sq += layer.alpha.pow(2).sum().item()
+                
+            # Calculer les contributions
+            total_norm_sq = linear_norm_sq + kan_norm_sq
+            
+            if total_norm_sq > 0:
+                linear_contribution = linear_norm_sq / total_norm_sq
+                nonlinear_contribution = kan_norm_sq / total_norm_sq
+            else:
+                linear_contribution = 0.5
+                nonlinear_contribution = 0.5
+                
+            return {
+                'linear_norm_sq': linear_norm_sq,
+                'kan_norm_sq': kan_norm_sq,
+                'linear_contribution': linear_contribution,
+                'nonlinear_contribution': nonlinear_contribution,
+                'kan_weight_norm': kan_norm_sq ** 0.5
+            }
+
     def fit(
         self, 
         X_train: torch.Tensor,
@@ -313,12 +375,14 @@ class KANAutoencoder(nn.Module):
             # Fallback : split aléatoire (pour compatibilité legacy)
             if verbose:
                 print(f"⚠️  Utilisation du split aléatoire (validation_split={validation_split})")
-                print(f"   💡 Recommandation: fournir X_val pour données temporelles")
+                print("   💡 Recommandation: fournir X_val pour données temporelles")
             
             n_samples = X_train.size(0)
             n_val = int(n_samples * validation_split)
             indices = torch.randperm(n_samples)
             X_train, X_val = X_train[indices[n_val:]], (X_train[indices[:n_val]] if n_val > 0 else None)
+            print(f"   📊 Train: {X_train.shape[0]} échantillons")
+            print(f"   📊 Val: {X_val.shape[0]} échantillons")
 
         train_loader = torch.utils.data.DataLoader(
             torch.utils.data.TensorDataset(X_train, X_train),
@@ -331,7 +395,9 @@ class KANAutoencoder(nn.Module):
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=max(1, patience // 2), factor=0.5)
 
         history = {'train_loss': [], 'val_loss': [], 'learning_rate': [],
-                   'regularization': [], 'skip_gain': [], 'skip_weight_norm': []}
+                   'regularization': [], 'skip_gain': [], 'skip_weight_norm': [],
+                   'kan_reg': [], 'skip_l2_reg': [],
+                   'linear_contribution': [], 'nonlinear_contribution': [], 'kan_weight_norm': []}  # Ajouter les nouvelles clés
 
         best_val_loss = float('10000')
         patience_counter = 0
@@ -401,37 +467,47 @@ class KANAutoencoder(nn.Module):
             # validation
             val_loss = None
             if X_val is not None:
-                self.eval()
-                with torch.no_grad():
-                    vh, _ = self(X_val.to(device))
-                    val_loss = criterion(vh, X_val.to(device)).item()
-                history['val_loss'].append(val_loss)
-                scheduler.step(val_loss)
+                try:
+                    self.eval()
+                    with torch.no_grad():
+                        X_val_device = X_val.to(device)  # Déplacer X_val sur device une seule fois
+                        vh, _ = self(X_val_device)
+                        val_loss = criterion(vh, X_val_device).item()
+                    history['val_loss'].append(val_loss)
+                    scheduler.step(val_loss)
 
-                # Comparer avec la validation loss précédente
-                prev_val_loss = history['val_loss'][-2] if len(history['val_loss']) > 1 else float('inf')
-                if val_loss < best_val_loss - 1e-9:
-                    best_val_loss = val_loss
-                    patience_counter = 0
-                    best_state = {k: v.detach().cpu() for k, v in self.state_dict().items()}
+                    # Comparer avec la validation loss précédente
+                    prev_val_loss = history['val_loss'][-2] if len(history['val_loss']) > 1 else float('inf')
+                    if val_loss < best_val_loss - 1e-9:
+                        best_val_loss = val_loss
+                        patience_counter = 0
+                        best_state = {k: v.detach().cpu() for k, v in self.state_dict().items()}
+                    else:
+                        patience_counter += 1
+                        if patience_counter >= patience:
+                            if verbose:
+                                print(f"🛑 Early stopping à l'époque {epoch+1}")
+                            break
+                except Exception as e:
+                    if verbose:
+                        print(f"⚠️ Erreur lors de la validation: {e}")
+                        import traceback
+                        traceback.print_exc()
+                    val_loss = None
+
+            # Affichage du verbose - toujours afficher si verbose=True
+            if verbose:
+                if val_loss is not None:
+                    validation_symbol = "✅" if val_loss < prev_val_loss else "❌"
+                    print(f"📈 Epoch {epoch+1}/{epochs} | Train: {avg_train_loss:.6f} | "
+                          f"Val: {val_loss:.6f} {validation_symbol} | "
+                          f"Reg: {avg_reg_loss:.6f} | LR: {optimizer.param_groups[0]['lr']:.2e}")
+                    if self.use_global_skip:
+                        print(f"   ↳ skip_gain={history['skip_gain'][-1]:.4f} | "
+                              f"||W_skip||={history['skip_weight_norm'][-1]:.4f}")
                 else:
-                    patience_counter += 1
-                    if patience_counter >= patience:
-                        if verbose:
-                            print(f"🛑 Early stopping à l'époque {epoch+1}")
-                        break
-
-            if verbose and val_loss is not None:
-                validation_symbol = "✅" if val_loss < prev_val_loss else "❌"
-                print(f"📈 Epoch {epoch+1}/{epochs} | Train: {avg_train_loss:.6f} | "
-                      f"Val: {val_loss:.6f} {validation_symbol} | "
-                      f"Reg: {avg_reg_loss:.6f} | LR: {optimizer.param_groups[0]['lr']:.2e}")
-                if self.use_global_skip:
-                    print(f"   ↳ skip_gain={history['skip_gain'][-1]:.4f} | "
-                          f"||W_skip||={history['skip_weight_norm'][-1]:.4f}")
-            elif verbose:
-                print(f"📈 Epoch {epoch+1}/{epochs} | Train: {avg_train_loss:.6f} | "
-                      f"Reg: {avg_reg_loss:.6f} | LR: {optimizer.param_groups[0]['lr']:.2e}")
+                    print(f"📈 Epoch {epoch+1}/{epochs} | Train: {avg_train_loss:.6f} | "
+                          f"Reg: {avg_reg_loss:.6f} | LR: {optimizer.param_groups[0]['lr']:.2e}")
 
         if 'best_state' in locals():
             self.load_state_dict(best_state)
