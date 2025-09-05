@@ -1,26 +1,22 @@
 """
-Autoencodeur KAN (encodeur/décodeur basés sur KANLayer) avec choix de base :
-- "spline" (par défaut, M=16)
-- "poly" (degré p ; stabilisé par clipping/normalisation)
+Autoencodeur KAN avec options de loss basées sur la corrélation et le cosinus.
 
 Fonctions de loss supportées :
 - "mse" : Mean Squared Error (par défaut)
-- "huber" : Huber Loss (plus robuste aux outliers, paramètre delta configurable)
+- "huber" : Huber Loss (plus robuste aux outliers)
+- "correlation" : 1 - corr(x, x̂) par colonne (invariante à l'échelle)
+- "cosine" : 1 - cos(x, x̂) par colonne (invariante à l'échelle)
+- "corr_mse_mix" : α*MSE + β*(1-corr) (MSE stabilise, corr force la structure)
 
-Architecture flexible :
-  Enc: KAN(N,h1) → (SiLU?) → Dropout → KAN(h1,h2) → (SiLU?) → ... → Linear(hn→k)
-  Dec: Linear(k→hn) → KAN(hn,h(n-1)) → (SiLU?) → Dropout → ... → KAN(h1→N)
-  
-où h1, h2, ..., hn sont définies par le paramètre hidden_dims
-
-Skip connections :
-- max_skip_gain : si > 0, limite la valeur maximale du gain de skip global ET des gains des couches KAN pendant l'entraînement
+La loss de corrélation/cosinus empêche que x̂ soit constant car la corrélation
+d'un vecteur constant est indéfinie/nulle.
 """
 
 from __future__ import annotations
 from typing import Optional, List
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from .kan_layers import KANLayer
 
 
@@ -81,7 +77,134 @@ class WeightedHuberLoss(nn.Module):
                 return loss
 
 
-class KANAutoencoder(nn.Module):
+class CorrelationLoss(nn.Module):
+    """
+    Loss basée sur la corrélation : 1 - corr(x, x̂) par colonne.
+    Invariante à l'échelle et empêche les vecteurs constants.
+    """
+    def __init__(self, reduction: str = 'mean', eps: float = 1e-8):
+        super().__init__()
+        self.reduction = reduction
+        self.eps = eps
+        
+    def forward(self, input: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            input: Prédictions (B, N)
+            target: Vraies valeurs (B, N)
+        """
+        # Calculer la corrélation par colonne
+        # Centrer les données
+        input_centered = input - input.mean(dim=0, keepdim=True)
+        target_centered = target - target.mean(dim=0, keepdim=True)
+        
+        # Calculer le numérateur et dénominateur de la corrélation
+        numerator = (input_centered * target_centered).sum(dim=0)
+        input_std = torch.sqrt((input_centered ** 2).sum(dim=0) + self.eps)
+        target_std = torch.sqrt((target_centered ** 2).sum(dim=0) + self.eps)
+        
+        # Éviter la division par zéro et les corrélations indéfinies
+        denominator = input_std * target_std
+        valid_mask = denominator > self.eps
+        
+        # Calculer la corrélation seulement pour les colonnes valides
+        correlation = torch.zeros_like(numerator)
+        correlation[valid_mask] = numerator[valid_mask] / denominator[valid_mask]
+        
+        # Clamper la corrélation entre -1 et 1 pour éviter les erreurs numériques
+        correlation = torch.clamp(correlation, -1.0, 1.0)
+        
+        # Loss = 1 - corrélation (on veut maximiser la corrélation)
+        loss = 1.0 - correlation
+        
+        if self.reduction == 'mean':
+            return loss.mean()
+        elif self.reduction == 'sum':
+            return loss.sum()
+        else:
+            return loss
+
+
+class CosineLoss(nn.Module):
+    """
+    Loss basée sur le cosinus : 1 - cos(x, x̂) par colonne.
+    Invariante à l'échelle et empêche les vecteurs constants.
+    """
+    def __init__(self, reduction: str = 'mean', eps: float = 1e-8):
+        super().__init__()
+        self.reduction = reduction
+        self.eps = eps
+        
+    def forward(self, input: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            input: Prédictions (B, N)
+            target: Vraies valeurs (B, N)
+        """
+        # Calculer le cosinus par colonne
+        # Normaliser les vecteurs colonnes
+        input_norm = F.normalize(input, p=2, dim=0, eps=self.eps)
+        target_norm = F.normalize(target, p=2, dim=0, eps=self.eps)
+        
+        # Calculer le cosinus (produit scalaire des vecteurs normalisés)
+        cosine_sim = (input_norm * target_norm).sum(dim=0)
+        
+        # Clamper pour éviter les erreurs numériques
+        cosine_sim = torch.clamp(cosine_sim, -1.0, 1.0)
+        
+        # Loss = 1 - cosinus (on veut maximiser la similarité cosinus)
+        loss = 1.0 - cosine_sim
+        
+        if self.reduction == 'mean':
+            return loss.mean()
+        elif self.reduction == 'sum':
+            return loss.sum()
+        else:
+            return loss
+
+
+class CorrelationMSELoss(nn.Module):
+    """
+    Loss mixte : α*MSE + β*(1-corr).
+    La MSE stabilise, la corrélation force la structure (non-constance).
+    """
+    def __init__(self, alpha: float = 1.0, beta: float = 1.0, reduction: str = 'mean', eps: float = 1e-8):
+        super().__init__()
+        self.alpha = alpha
+        self.beta = beta
+        self.reduction = reduction
+        self.eps = eps
+        self.mse_loss = nn.MSELoss(reduction='none')
+        self.corr_loss = CorrelationLoss(reduction='none', eps=eps)
+        
+    def forward(self, input: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            input: Prédictions (B, N)
+            target: Vraies valeurs (B, N)
+        """
+        # Calculer MSE par colonne
+        mse = self.mse_loss(input, target)
+        if self.reduction == 'mean':
+            mse = mse.mean(dim=0)  # Moyenne par colonne
+        elif self.reduction == 'sum':
+            mse = mse.sum(dim=0)   # Somme par colonne
+        
+        # Calculer la loss de corrélation
+        corr_loss = self.corr_loss(input, target)
+        
+        # Combiner les deux losses
+        total_loss = self.alpha * mse + self.beta * corr_loss
+        
+        if self.reduction == 'mean':
+            return total_loss.mean()
+        elif self.reduction == 'sum':
+            return total_loss.sum()
+        else:
+            return total_loss
+
+
+class KANAutoencoderCorrelation(nn.Module):
     def __init__(
         self,
         input_dim: int,
@@ -96,8 +219,13 @@ class KANAutoencoder(nn.Module):
         dropout_p: float = 0.05,
         use_silu: bool = True,
         # fonction de loss
-        loss_type: str = "mse",                    # "mse" | "huber"
+        loss_type: str = "mse",                    # "mse" | "huber" | "correlation" | "cosine" | "corr_mse_mix"
         huber_delta: float = 1.0,                  # paramètre delta pour Huber Loss
+        # paramètres pour corr_mse_mix
+        alpha: float = 1.0,                        # poids pour MSE dans corr_mse_mix
+        beta: float = 1.0,                         # poids pour corrélation dans corr_mse_mix
+        
+        
         # régularisations KAN
         lambda_alpha: float = 1e-4,
         lambda_group: float = 1e-5,
@@ -109,7 +237,7 @@ class KANAutoencoder(nn.Module):
         skip_init: str = "zeros",                  # "zeros" | "xavier" | "identity"
         skip_gain: float = 1.0,
         lambda_skip_l2: float = 0.0,
-        max_skip_gain: float = 1.0                 # gain max autorisé pour global ET couches KAN (0 = pas de limite)
+        max_skip_gain: float = 1.0                 # gain max autorisé (0 = pas de limite)
     ):
         super().__init__()
         self.input_dim = int(input_dim)
@@ -119,14 +247,15 @@ class KANAutoencoder(nn.Module):
             hidden_dims = [128, 32]
         self.hidden_dims = list(hidden_dims)
         self.use_silu = use_silu
-        self.use_skip = use_skip
-        self.max_skip_gain = float(max_skip_gain)
 
         # Configuration de la fonction de loss
         self.loss_type = loss_type.lower()
         self.huber_delta = huber_delta
-        if self.loss_type not in ["mse", "huber"]:
-            raise ValueError(f"loss_type doit être 'mse' ou 'huber', reçu: {loss_type}")
+        self.alpha = alpha
+        self.beta = beta
+        
+        if self.loss_type not in ["mse", "huber", "correlation", "cosine", "corr_mse_mix"]:
+            raise ValueError(f"loss_type doit être 'mse', 'huber', 'correlation', 'cosine', ou 'corr_mse_mix', reçu: {loss_type}")
 
         # --------- ENCODEUR ---------
         self.encoder_layers = nn.ModuleList()
@@ -192,6 +321,7 @@ class KANAutoencoder(nn.Module):
 
         # --------- GLOBAL SKIP (entrée -> sortie) ---------
         self.use_global_skip = bool(use_global_skip)
+        self.max_skip_gain = float(max_skip_gain)
         if self.use_global_skip:
             self.global_skip = nn.Linear(input_dim, input_dim, bias=False)
             if skip_init == "zeros":
@@ -207,26 +337,6 @@ class KANAutoencoder(nn.Module):
             self.global_skip = None
             self.global_skip_gain = None
             self.lambda_global_skip_l2 = 0.0
-
-    def _apply_skip_gain_clipping(self):
-        """Applique le clipping du max_skip_gain à tous les gains de skip (global et couches KAN)"""
-        if self.max_skip_gain <= 0:
-            return
-            
-        # Clipper le gain global
-        if self.use_global_skip and self.global_skip_gain is not None:
-            with torch.no_grad():
-                self.global_skip_gain.clamp_(max=self.max_skip_gain)
-        
-        # Clipper les gains des couches KAN
-        if self.use_skip:
-            with torch.no_grad():
-                for layer in self.encoder_layers:
-                    if hasattr(layer, 'skip_gain') and layer.skip_gain is not None:
-                        layer.skip_gain.clamp_(max=self.max_skip_gain)
-                for layer in self.decoder_layers:
-                    if hasattr(layer, 'skip_gain') and layer.skip_gain is not None:
-                        layer.skip_gain.clamp_(max=self.max_skip_gain)
 
     # ---------- API ----------
     def encode(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
@@ -264,6 +374,12 @@ class KANAutoencoder(nn.Module):
             return nn.MSELoss()
         elif self.loss_type == "huber":
             return nn.HuberLoss(delta=self.huber_delta)
+        elif self.loss_type == "correlation":
+            return CorrelationLoss()
+        elif self.loss_type == "cosine":
+            return CosineLoss()
+        elif self.loss_type == "corr_mse_mix":
+            return CorrelationMSELoss(alpha=self.alpha, beta=self.beta)
         else:
             raise ValueError(f"Type de loss non supporté: {self.loss_type}")
 
@@ -289,9 +405,9 @@ class KANAutoencoder(nn.Module):
         if device is None:
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.to(device)
-        
+
         # split train/val
-        n_samples = X.shape[0]
+        n_samples = X.size(0)
         n_val = int(n_samples * validation_split)
         indices = torch.randperm(n_samples)
         X_train, X_val = X[indices[n_val:]], (X[indices[:n_val]] if n_val > 0 else None)
@@ -306,14 +422,8 @@ class KANAutoencoder(nn.Module):
         criterion = self.get_loss_criterion()
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=max(1, patience // 2), factor=0.5)
 
-        # Initialiser l'historique avec les métriques de skip global et KAN
         history = {'train_loss': [], 'val_loss': [], 'learning_rate': [],
                    'regularization': [], 'skip_gain': [], 'skip_weight_norm': []}
-        
-        # Si use_skip est activé, ajouter des métriques pour les skip gains des couches KAN
-        if self.use_skip:
-            history['kan_encoder_skip_gains'] = []
-            history['kan_decoder_skip_gains'] = []
 
         best_val_loss = float('10000')
         patience_counter = 0
@@ -331,10 +441,6 @@ class KANAutoencoder(nn.Module):
                 loss = recon_loss + lambda_reg * reg_term
                 loss.backward()
                 optimizer.step()
-                
-                # Appliquer le clipping après chaque step d'optimisation
-                self._apply_skip_gain_clipping()
-                
                 train_loss += recon_loss.item()
                 reg_loss += reg_term.item()
 
@@ -354,23 +460,6 @@ class KANAutoencoder(nn.Module):
                         effective_gain = self.global_skip_gain
                     history['skip_gain'].append(float(effective_gain.item()))
                     history['skip_weight_norm'].append(float(self.global_skip.weight.norm().item()))
-
-            # Log des skip gains des couches KAN si activés
-            if self.use_skip:
-                with torch.no_grad():
-                    # Gains des encodeur layers
-                    encoder_gains = []
-                    for layer in self.encoder_layers:
-                        if hasattr(layer, 'skip_gain') and layer.skip_gain is not None:
-                            encoder_gains.append(float(layer.skip_gain.item()))
-                    history['kan_encoder_skip_gains'].append(encoder_gains)
-                    
-                    # Gains des decoder layers
-                    decoder_gains = []
-                    for layer in self.decoder_layers:
-                        if hasattr(layer, 'skip_gain') and layer.skip_gain is not None:
-                            decoder_gains.append(float(layer.skip_gain.item()))
-                    history['kan_decoder_skip_gains'].append(decoder_gains)
 
             # validation
             if X_val is not None:
@@ -400,11 +489,8 @@ class KANAutoencoder(nn.Module):
                       f"Val: {val_loss if X_val is not None else 0:.6f} {validation_symbol} | "
                       f"Reg: {avg_reg_loss:.6f} | LR: {optimizer.param_groups[0]['lr']:.2e}")
                 if self.use_global_skip:
-                    print(f"   ↳ global_skip_gain={history['skip_gain'][-1]:.4f} | "
+                    print(f"   ↳ skip_gain={history['skip_gain'][-1]:.4f} | "
                           f"||W_skip||={history['skip_weight_norm'][-1]:.4f}")
-                if self.use_skip:
-                    print(f"   ↳ KAN encoder skip gains: {[f'{g:.4f}' for g in history['kan_encoder_skip_gains'][-1]]}")
-                    print(f"   ↳ KAN decoder skip gains: {[f'{g:.4f}' for g in history['kan_decoder_skip_gains'][-1]]}")
 
         if 'best_state' in locals():
             self.load_state_dict(best_state)
