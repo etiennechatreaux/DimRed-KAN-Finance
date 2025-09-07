@@ -112,8 +112,8 @@ def summarize_events(events_df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def import_sector_data(sector):
-    sector_dir = f"data/processed/sectors/{sector.lower().replace(' ', '_')}"
+def import_sector_data(sector, data_dir):
+    sector_dir = f"{data_dir}/data/processed/sectors/{sector.lower().replace(' ', '_')}"
     sector_returns = pd.read_csv(f"{sector_dir}/returns.csv", index_col=0)
     sector_log_returns = pd.read_csv(f"{sector_dir}/log_returns.csv", index_col=0)
     
